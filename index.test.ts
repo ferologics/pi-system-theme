@@ -21,7 +21,10 @@ vi.mock("node:child_process", () => {
     return { execFile };
 });
 
+type TerminalInputHandler = (data: string) => { consume?: boolean; data?: string } | undefined;
+
 type SessionStartHandler = (event: unknown, ctx: TestContext) => Promise<void> | void;
+type SessionShutdownHandler = () => void;
 
 type TestContext = {
     hasUI: boolean;
@@ -30,14 +33,17 @@ type TestContext = {
         getAllThemes: () => Array<{ name: string; path?: string }>;
         setTheme: (theme: string) => { success: boolean; error?: string };
         notify: (message: string, level?: string) => void;
+        onTerminalInput: (handler: TerminalInputHandler) => () => void;
     };
 };
 
 const originalPlatform = process.platform;
 const originalHome = process.env.HOME;
+const originalColorFgBg = process.env.COLORFGBG;
 let testHome = "";
 let setIntervalSpy: { mockRestore: () => void };
 let clearIntervalSpy: { mockRestore: () => void };
+let stdoutWriteSpy: { mockRestore: () => void };
 
 function setPlatform(platform: NodeJS.Platform): void {
     Object.defineProperty(process, "platform", { value: platform });
@@ -65,15 +71,21 @@ async function writeConfig(config: Record<string, unknown>): Promise<void> {
     await writeFile(configPath, `${JSON.stringify(config, null, 4)}\n`, "utf8");
 }
 
-async function createExtensionRuntime(): Promise<{ sessionStart: SessionStartHandler }> {
+async function createExtensionRuntime(): Promise<{
+    sessionStart: SessionStartHandler;
+    sessionShutdown: SessionShutdownHandler;
+}> {
     const { default: systemThemeExtension } = await import("./index.js");
 
     let sessionStartHandler: SessionStartHandler | undefined;
+    let sessionShutdownHandler: SessionShutdownHandler | undefined;
 
     const pi = {
-        on: (event: string, handler: SessionStartHandler) => {
+        on: (event: string, handler: SessionStartHandler | SessionShutdownHandler) => {
             if (event === "session_start") {
-                sessionStartHandler = handler;
+                sessionStartHandler = handler as SessionStartHandler;
+            } else if (event === "session_shutdown") {
+                sessionShutdownHandler = handler as SessionShutdownHandler;
             }
         },
         registerCommand: () => undefined,
@@ -85,8 +97,13 @@ async function createExtensionRuntime(): Promise<{ sessionStart: SessionStartHan
         throw new Error("session_start handler was not registered");
     }
 
+    if (!sessionShutdownHandler) {
+        throw new Error("session_shutdown handler was not registered");
+    }
+
     return {
         sessionStart: sessionStartHandler,
+        sessionShutdown: sessionShutdownHandler,
     };
 }
 
@@ -100,6 +117,7 @@ type CreatedContext = {
     ctx: TestContext;
     setThemeMock: ReturnType<typeof vi.fn>;
     notifyMock: ReturnType<typeof vi.fn>;
+    simulateTerminalInput: (data: string) => void;
 };
 
 function createContext(options?: CreateContextOptions): CreatedContext {
@@ -113,6 +131,8 @@ function createContext(options?: CreateContextOptions): CreatedContext {
         return { success: true };
     });
 
+    let registeredInputHandler: TerminalInputHandler | null = null;
+
     const ctx: TestContext = {
         hasUI,
         ui: {
@@ -120,6 +140,12 @@ function createContext(options?: CreateContextOptions): CreatedContext {
             getAllThemes: () => themes.map((name) => ({ name })),
             setTheme: setThemeMock,
             notify: notifyMock,
+            onTerminalInput: (handler) => {
+                registeredInputHandler = handler;
+                return () => {
+                    registeredInputHandler = null;
+                };
+            },
         },
     };
 
@@ -127,6 +153,9 @@ function createContext(options?: CreateContextOptions): CreatedContext {
         ctx,
         setThemeMock,
         notifyMock,
+        simulateTerminalInput: (data: string) => {
+            registeredInputHandler?.(data);
+        },
     };
 }
 
@@ -144,16 +173,21 @@ beforeEach(async () => {
     await clearConfig();
     setPlatform(originalPlatform);
 
+    delete process.env.COLORFGBG;
+
     setIntervalSpy = vi
         .spyOn(globalThis, "setInterval")
-        .mockImplementation(() => 0 as unknown as ReturnType<typeof setInterval>);
+        .mockImplementation(() => 1 as unknown as ReturnType<typeof setInterval>);
 
     clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+
+    stdoutWriteSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 });
 
 afterEach(() => {
     setIntervalSpy.mockRestore();
     clearIntervalSpy.mockRestore();
+    stdoutWriteSpy.mockRestore();
 });
 
 afterAll(async () => {
@@ -164,6 +198,12 @@ afterAll(async () => {
         delete process.env.HOME;
     } else {
         process.env.HOME = originalHome;
+    }
+
+    if (originalColorFgBg === undefined) {
+        delete process.env.COLORFGBG;
+    } else {
+        process.env.COLORFGBG = originalColorFgBg;
     }
 
     setPlatform(originalPlatform);
@@ -352,5 +392,180 @@ describe("pi-system-theme", () => {
         await sessionStart({}, ctx);
 
         expect(setThemeMock).toHaveBeenCalledWith("light");
+    });
+
+    describe("COLORFGBG detection", () => {
+        it("detects dark appearance when COLORFGBG background is < 8", async () => {
+            setPlatform("darwin");
+            process.env.COLORFGBG = "15;0";
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock } = createContext({ themeName: "light" });
+
+            await sessionStart({}, ctx);
+
+            expect(setThemeMock).toHaveBeenCalledWith("dark");
+            expect(execFileAsyncMock).not.toHaveBeenCalled();
+        });
+
+        it("detects light appearance when COLORFGBG background is >= 8", async () => {
+            setPlatform("darwin");
+            process.env.COLORFGBG = "0;15";
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock } = createContext({ themeName: "dark" });
+
+            await sessionStart({}, ctx);
+
+            expect(setThemeMock).toHaveBeenCalledWith("light");
+            expect(execFileAsyncMock).not.toHaveBeenCalled();
+        });
+
+        it("uses the last segment of COLORFGBG as the background color", async () => {
+            setPlatform("darwin");
+            process.env.COLORFGBG = "0;8;15";
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock } = createContext({ themeName: "dark" });
+
+            await sessionStart({}, ctx);
+
+            expect(setThemeMock).toHaveBeenCalledWith("light");
+            expect(execFileAsyncMock).not.toHaveBeenCalled();
+        });
+
+        it("takes priority over OS appearance detection", async () => {
+            setPlatform("darwin");
+            process.env.COLORFGBG = "0;15"; // light
+
+            execFileAsyncMock.mockResolvedValue({ stdout: "Dark\n" }); // OS says dark
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock } = createContext({ themeName: "dark" });
+
+            await sessionStart({}, ctx);
+
+            expect(setThemeMock).toHaveBeenCalledWith("light");
+            expect(execFileAsyncMock).not.toHaveBeenCalled();
+        });
+
+        it("ignores COLORFGBG when value is not a valid number", async () => {
+            setPlatform("darwin");
+            process.env.COLORFGBG = "foo;bar";
+
+            execFileAsyncMock.mockImplementation(async (file) => {
+                if (file !== "/usr/bin/defaults") throw new Error(`Unexpected command: ${file}`);
+                return { stdout: "Dark\n" };
+            });
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock } = createContext({ themeName: "light" });
+
+            await sessionStart({}, ctx);
+
+            expect(setThemeMock).toHaveBeenCalledWith("dark");
+            expect(execFileAsyncMock).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe("terminal push detection", () => {
+        it("applies dark appearance from mode 2031 push notification (value=1)", async () => {
+            setPlatform("darwin");
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock, simulateTerminalInput } = createContext({ themeName: "light" });
+
+            await sessionStart({}, ctx);
+
+            simulateTerminalInput("\x1b[?997;1n"); // 1 = dark
+
+            // wait for the 100 ms debounce (setTimeout is not mocked here)
+            await new Promise<void>((r) => setTimeout(r, 150));
+
+            expect(setThemeMock).toHaveBeenCalledWith("dark");
+        });
+
+        it("applies light appearance from mode 2031 push notification (value=2)", async () => {
+            setPlatform("darwin");
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock, simulateTerminalInput } = createContext({ themeName: "dark" });
+
+            await sessionStart({}, ctx);
+
+            simulateTerminalInput("\x1b[?997;2n"); // 2 = light
+
+            // wait for the 100 ms debounce (setTimeout is not mocked here)
+            await new Promise<void>((r) => setTimeout(r, 150));
+
+            expect(setThemeMock).toHaveBeenCalledWith("light");
+        });
+
+        it("stops polling once mode 2031 push is confirmed", async () => {
+            setPlatform("darwin");
+
+            execFileAsyncMock.mockResolvedValue({ stdout: "Dark\n" });
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, simulateTerminalInput } = createContext({ themeName: "dark" });
+
+            await sessionStart({}, ctx);
+
+            const setIntervalCallCount = (setIntervalSpy as ReturnType<typeof vi.spyOn>).mock.calls.length;
+
+            // onPushConfirmed fires synchronously on the first mode-2031 input
+            simulateTerminalInput("\x1b[?997;2n");
+
+            // interval must have been cleared after push confirmed
+            expect(clearIntervalSpy).toHaveBeenCalled();
+            // no new interval registered after push
+            expect((setIntervalSpy as ReturnType<typeof vi.spyOn>).mock.calls.length).toBe(setIntervalCallCount);
+        });
+
+        it("applies dark appearance from OSC 11 response with dark background", async () => {
+            setPlatform("darwin");
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock, simulateTerminalInput } = createContext({ themeName: "light" });
+
+            await sessionStart({}, ctx);
+
+            // Simulate: osc11 pending → send OSC 11 response with dark background (rgb ~0x1c/0x1c/0x1c)
+            // then close with DA1 to flush
+            simulateTerminalInput("\x1b]11;rgb:1c1c/1c1c/1c1c\x07");
+
+            expect(setThemeMock).toHaveBeenCalledWith("dark");
+        });
+
+        it("applies light appearance from OSC 11 response with bright background", async () => {
+            setPlatform("darwin");
+
+            const { sessionStart } = await createExtensionRuntime();
+            const { ctx, setThemeMock, simulateTerminalInput } = createContext({ themeName: "dark" });
+
+            await sessionStart({}, ctx);
+
+            // Light background: rgb ~0xffff/0xffff/0xffff
+            simulateTerminalInput("\x1b]11;rgb:ffff/ffff/ffff\x07");
+
+            expect(setThemeMock).toHaveBeenCalledWith("light");
+        });
+
+        it("cleans up terminal detector on session_shutdown", async () => {
+            setPlatform("darwin");
+
+            const { sessionStart, sessionShutdown } = await createExtensionRuntime();
+            const { ctx } = createContext({ themeName: "dark" });
+
+            await sessionStart({}, ctx);
+
+            sessionShutdown();
+
+            // MODE_2031_DISABLE escape must have been written to stdout
+            const writtenData = (stdoutWriteSpy as ReturnType<typeof vi.spyOn>).mock.calls
+                .map((call) => call[0])
+                .join("");
+            expect(writtenData).toContain("\x1b[?2031l");
+        });
     });
 });
