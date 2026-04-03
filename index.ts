@@ -324,6 +324,7 @@ function createTerminalDetector(): TerminalDetector {
     let unsubscribeInput: (() => void) | null = null;
     let mode2031Active = false;
     let osc11Pending = false;
+    let da1Pending = false; // independently track DA1 so it's consumed even if OSC 11 arrived first
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
     let osc11Buffer = "";
 
@@ -342,6 +343,7 @@ function createTerminalDetector(): TerminalDetector {
             const queryOsc11 = (): void => {
                 if (osc11Pending) return;
                 osc11Pending = true;
+                da1Pending = true;
                 osc11Buffer = "";
                 write(OSC_11_QUERY + DA1_QUERY);
             };
@@ -362,10 +364,15 @@ function createTerminalDetector(): TerminalDetector {
                     return { consume: true };
                 }
 
-                if (osc11Pending && DA1_RESPONSE.test(data)) {
-                    osc11Pending = false;
-                    osc11Buffer = "";
-                    return undefined;
+                // DA1 is the terminal's response to our DA1_QUERY marker — never user input.
+                // Consume it regardless of whether OSC 11 was already processed in a prior chunk.
+                if (da1Pending && DA1_RESPONSE.test(data)) {
+                    da1Pending = false;
+                    if (osc11Pending) {
+                        osc11Pending = false;
+                        osc11Buffer = "";
+                    }
+                    return { consume: true };
                 }
 
                 if (osc11Pending) {
@@ -414,6 +421,7 @@ function createTerminalDetector(): TerminalDetector {
             write(MODE_2031_DISABLE);
             mode2031Active = false;
             osc11Pending = false;
+            da1Pending = false;
             osc11Buffer = "";
         },
     };
