@@ -1,13 +1,20 @@
 # pi-system-theme
 
-A Pi extension that syncs Pi's theme with system appearance (dark/light mode) on macOS, Linux, and Windows.
+A Pi extension that automatically syncs Pi's theme with your system appearance (dark/light mode) on macOS, Linux, and Windows.
 
-## Behavior
+## How it works
 
-- Dark appearance -> `darkTheme`
-- Light appearance -> `lightTheme`
+On session start the extension tries to detect and follow your OS/terminal theme. It uses two mechanisms, preferring the more responsive one:
 
-Detection backends:
+### 1. Terminal push notifications (preferred)
+
+When your terminal supports it, the extension opts in to *push* notifications via mode 2031. The terminal then emits a `CSI ?997;{1|2}n` sequence whenever its theme changes — the extension reacts immediately without any polling.
+
+As part of startup it also sends an **OSC 11** background-colour query so it can set the correct theme right away, before any theme-change event arrives.
+
+### 2. OS API polling (fallback)
+
+When push notifications aren't available, the extension polls the OS on a configurable interval:
 
 ```bash
 # macOS
@@ -20,6 +27,8 @@ gsettings get org.gnome.desktop.interface color-scheme
 # Windows
 reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v AppsUseLightTheme
 ```
+
+Before spawning any subprocess, the extension first checks the `COLORFGBG` environment variable exported by many terminal emulators — if present, it skips the OS call entirely.
 
 If detection fails or returns an unknown value, the extension keeps the current Pi theme unchanged.
 
@@ -60,7 +69,7 @@ Choose **Save and apply** to persist overrides and apply immediately.
 
 ## Notes
 
-- This extension acts on macOS, Linux, and Windows (`darwin`, `linux`, `win32`).
+- When terminal push notifications are confirmed, the polling loop is stopped entirely for the session.
 - Linux support currently depends on GNOME-compatible `gsettings` keys (`color-scheme`, with `gtk-theme` fallback).
 - Windows support reads `AppsUseLightTheme` from `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`.
 - In headless modes without theme support (for example `-p` print mode), the extension stays idle.
