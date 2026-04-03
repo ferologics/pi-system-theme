@@ -21,9 +21,19 @@ const DEFAULT_CONFIG: Config = {
     pollMs: 2000,
 };
 
-const GLOBAL_CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "system-theme.json");
+const GLOBAL_CONFIG_PATH = path.join(process.env.HOME ?? os.homedir(), ".pi", "agent", "system-theme.json");
 const DETECTION_TIMEOUT_MS = 1200;
 const MIN_POLL_MS = 500;
+
+const OSC_11_QUERY = "\x1b]11;?\x07";
+const DA1_QUERY = "\x1b[c";
+const MODE_2031_ENABLE = "\x1b[?2031h";
+const MODE_2031_DISABLE = "\x1b[?2031l";
+const CSI_996_QUERY = "\x1b[?996n";
+
+const OSC_11_RESPONSE = /^\x1b\]11;rgba?:([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})/;
+const MODE_2031_RESPONSE = /^\x1b\[\?997;([12])n$/;
+const DA1_RESPONSE = /^\x1b\[\?[\d;]*c$/;
 
 function isObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -113,6 +123,20 @@ async function saveConfig(config: Config): Promise<{ wroteFile: boolean; overrid
     };
 }
 
+function parseColorComponent(hex: string): number {
+    const value = Number.parseInt(hex, 16);
+    const max = (16 ** hex.length) - 1;
+    return value / max;
+}
+
+function luminance(r: number, g: number, b: number): number {
+    return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+function appearanceFromLuminance(lum: number): Appearance {
+    return lum < 0.5 ? "dark" : "light";
+}
+
 function extractStderr(error: unknown): string {
     if (!error || typeof error !== "object") {
         return "";
@@ -130,10 +154,6 @@ function normalizeSettingValue(value: string): string {
     }
 
     return trimmed;
-}
-
-function isSupportedPlatform(): boolean {
-    return process.platform === "darwin" || process.platform === "linux" || process.platform === "win32";
 }
 
 function parseMacAppearance(value: string): Appearance | null {
@@ -277,6 +297,128 @@ async function detectAppearance(): Promise<Appearance | null> {
     }
 }
 
+function detectFromColorFgBg(): Appearance | null {
+    const colorfgbg = process.env.COLORFGBG ?? "";
+    if (!colorfgbg) return null;
+
+    const parts = colorfgbg.split(";");
+    if (parts.length < 2) return null;
+
+    const bg = Number.parseInt(parts[parts.length - 1], 10);
+    if (Number.isNaN(bg)) return null;
+
+    return bg < 8 ? "dark" : "light";
+}
+
+type TerminalDetector = {
+    start(
+        write: (data: string) => void,
+        onAppearance: (appearance: Appearance) => void,
+        registerInput: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void,
+        onPushConfirmed: () => void,
+    ): void;
+    stop(write: (data: string) => void): void;
+};
+
+function createTerminalDetector(): TerminalDetector {
+    let unsubscribeInput: (() => void) | null = null;
+    let mode2031Active = false;
+    let osc11Pending = false;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let osc11Buffer = "";
+
+    return {
+        start(write, onAppearance, registerInput, onPushConfirmed) {
+            const handleOsc11Response = (data: string): void => {
+                const match = data.match(OSC_11_RESPONSE);
+                if (!match) return;
+
+                const r = parseColorComponent(match[1]);
+                const g = parseColorComponent(match[2]);
+                const b = parseColorComponent(match[3]);
+                onAppearance(appearanceFromLuminance(luminance(r, g, b)));
+            };
+
+            const queryOsc11 = (): void => {
+                if (osc11Pending) return;
+                osc11Pending = true;
+                osc11Buffer = "";
+                write(OSC_11_QUERY + DA1_QUERY);
+            };
+
+            unsubscribeInput = registerInput((data: string) => {
+                const mode2031Match = data.match(MODE_2031_RESPONSE);
+                if (mode2031Match) {
+                    const appearance: Appearance = mode2031Match[1] === "2" ? "light" : "dark";
+                    if (!mode2031Active) {
+                        mode2031Active = true;
+                        onPushConfirmed();
+                    }
+                    if (debounceTimer) clearTimeout(debounceTimer);
+                    debounceTimer = setTimeout(() => {
+                        debounceTimer = null;
+                        onAppearance(appearance);
+                    }, 100);
+                    return { consume: true };
+                }
+
+                if (osc11Pending && DA1_RESPONSE.test(data)) {
+                    osc11Pending = false;
+                    osc11Buffer = "";
+                    return undefined;
+                }
+
+                if (osc11Pending) {
+                    if (data.startsWith("\x1b]11;")) {
+                        osc11Buffer = data;
+                    } else if (osc11Buffer.length > 0) {
+                        osc11Buffer += data;
+                    }
+
+                    if (osc11Buffer.length > 0 && (osc11Buffer.includes("\x07") || osc11Buffer.includes("\x1b\\"))) {
+                        osc11Pending = false;
+                        handleOsc11Response(osc11Buffer);
+                        osc11Buffer = "";
+                        return { consume: true };
+                    }
+
+                    if (osc11Buffer.length > 0) {
+                        return { consume: true };
+                    }
+                }
+
+                if (data.startsWith("\x1b]11;") && OSC_11_RESPONSE.test(data)) {
+                    osc11Pending = false;
+                    osc11Buffer = "";
+                    handleOsc11Response(data);
+                    return { consume: true };
+                }
+
+                return undefined;
+            });
+
+            write(CSI_996_QUERY);
+            queryOsc11();
+            write(MODE_2031_ENABLE);
+        },
+
+        stop(write) {
+            if (debounceTimer) {
+                clearTimeout(debounceTimer);
+                debounceTimer = null;
+            }
+            if (unsubscribeInput) {
+                unsubscribeInput();
+                unsubscribeInput = null;
+            }
+            write(MODE_2031_DISABLE);
+            mode2031Active = false;
+            osc11Pending = false;
+            osc11Buffer = "";
+        },
+    };
+}
+
 async function promptTheme(
     ctx: ExtensionCommandContext,
     label: string,
@@ -354,6 +496,28 @@ export default function systemThemeExtension(pi: ExtensionAPI): void {
     let syncInProgress = false;
     let lastSetThemeError: string | null = null;
     let didWarnDefaultThemeFallback = false;
+    let detector: TerminalDetector | null = null;
+    let pushConfirmed = false;
+
+    function applyAppearance(ctx: ExtensionContext, appearance: Appearance): void {
+        if (!shouldAutoSync(ctx, activeConfig)) return;
+
+        const targetTheme = appearance === "dark" ? activeConfig.darkTheme : activeConfig.lightTheme;
+        if (ctx.ui.theme.name === targetTheme) return;
+
+        const result = ctx.ui.setTheme(targetTheme);
+        if (result.success) {
+            lastSetThemeError = null;
+            return;
+        }
+
+        const message = result.error ?? "unknown error";
+        const errorKey = `${targetTheme}:${message}`;
+        if (errorKey !== lastSetThemeError) {
+            lastSetThemeError = errorKey;
+            console.warn(`[pi-system-theme] Failed to set theme "${targetTheme}": ${message}`);
+        }
+    }
 
     function maybeNotifyDefaultThemeFallback(ctx: ExtensionContext): void {
         if (didWarnDefaultThemeFallback || !canManageThemes(ctx) || hasThemeOverrides(activeConfig)) {
@@ -382,28 +546,18 @@ export default function systemThemeExtension(pi: ExtensionAPI): void {
         syncInProgress = true;
 
         try {
+            const fromEnv = detectFromColorFgBg();
+            if (fromEnv) {
+                applyAppearance(ctx, fromEnv);
+                return;
+            }
+
             const appearance = await detectAppearance();
             if (!appearance) {
                 return;
             }
 
-            const targetTheme = appearance === "dark" ? activeConfig.darkTheme : activeConfig.lightTheme;
-            if (ctx.ui.theme.name === targetTheme) {
-                return;
-            }
-
-            const result = ctx.ui.setTheme(targetTheme);
-            if (result.success) {
-                lastSetThemeError = null;
-                return;
-            }
-
-            const message = result.error ?? "unknown error";
-            const errorKey = `${targetTheme}:${message}`;
-            if (errorKey !== lastSetThemeError) {
-                lastSetThemeError = errorKey;
-                console.warn(`[pi-system-theme] Failed to set theme "${targetTheme}": ${message}`);
-            }
+            applyAppearance(ctx, appearance);
         } finally {
             syncInProgress = false;
         }
@@ -415,7 +569,7 @@ export default function systemThemeExtension(pi: ExtensionAPI): void {
             intervalId = null;
         }
 
-        if (!shouldAutoSync(ctx, activeConfig)) {
+        if (pushConfirmed || !shouldAutoSync(ctx, activeConfig)) {
             return;
         }
 
@@ -427,11 +581,6 @@ export default function systemThemeExtension(pi: ExtensionAPI): void {
     pi.registerCommand("system-theme", {
         description: "Configure pi-system-theme",
         handler: async (_args, ctx) => {
-            if (!isSupportedPlatform()) {
-                notifyInfoIfUI(ctx, "pi-system-theme currently supports macOS, Linux (GNOME gsettings), and Windows.");
-                return;
-            }
-
             if (!canManageThemes(ctx)) {
                 notifyInfoIfUI(ctx, "pi-system-theme settings require interactive theme support.");
                 return;
@@ -511,15 +660,27 @@ export default function systemThemeExtension(pi: ExtensionAPI): void {
     });
 
     pi.on("session_start", async (_event, ctx) => {
-        if (!isSupportedPlatform()) {
-            return;
-        }
-
         activeConfig = await loadConfig();
 
         if (!shouldAutoSync(ctx, activeConfig)) {
             maybeNotifyDefaultThemeFallback(ctx);
             return;
+        }
+
+        if (ctx.hasUI) {
+            detector = createTerminalDetector();
+            detector.start(
+                (data) => process.stdout.write(data),
+                (appearance) => applyAppearance(ctx, appearance),
+                (handler) => ctx.ui.onTerminalInput(handler),
+                () => {
+                    pushConfirmed = true;
+                    if (intervalId) {
+                        clearInterval(intervalId);
+                        intervalId = null;
+                    }
+                },
+            );
         }
 
         await syncTheme(ctx);
@@ -533,5 +694,12 @@ export default function systemThemeExtension(pi: ExtensionAPI): void {
 
         clearInterval(intervalId);
         intervalId = null;
+
+        if (detector) {
+            detector.stop((data) => process.stdout.write(data));
+            detector = null;
+        }
+
+        pushConfirmed = false;
     });
 }
